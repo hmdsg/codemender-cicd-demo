@@ -1,0 +1,36 @@
+[project]
+name = "expense-api"
+version = "0.1.0"
+description = "CodeMender ハンズオン用の教材アプリ（意図的に脆弱性を含む経費精算 API）"
+requires-python = ">=3.11"
+dependencies = [
+    "flask>=3.0",
+    "requests>=2.31",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "bandit>=1.7",
+]
+# semgrep は依存に含めない。baseline/semgrep.sarif の再生成にしか使わず、
+# 結果はコミット済みのため。外している理由:
+#   1. 推移的依存 (mcp) に HIGH の Dependabot アラートが出る
+#   2. 依存が重く、Cloud Shell の $HOME 5GB を圧迫する
+# 再生成が必要なときは uvx で一時実行する（ロックファイルに載らない）:
+#   uvx semgrep --config=p/python ...   ← scripts/05_run_baseline_sast.sh 参照
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# 教材アプリなので、意図的な脆弱性を lint で潰さない。
+# セキュリティ検査は semgrep / bandit / CodeMender に任せる。
+select = ["E", "F", "I"]
+ignore = ["E501"]

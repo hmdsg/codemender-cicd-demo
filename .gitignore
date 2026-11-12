@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# uv.lock は意図的にコミットする（受講者全員が同じ依存で動くように）
+
+# C / ASAN ビルド成果物
+native/out/
+
+# CodeMender の出力（各自の環境で生成されるもの）
+*.sarif
+!baseline/*.sarif
+cm-report.html
+report.html
+codemender.sarif
+codemender-findings.json
+.codemender/
+
+# cm が作るプロジェクト識別子。
+# ここで ignore しておかないと cm find の `git clean -fd` に毎回消される
+# （ignore 済みファイルは -x を付けない限り削除されない）。
+.cm_project
+
+# 教材アプリの実行時データは /tmp/cm-workshop/（リポジトリ外の絶対パス）に書かれるため、
+# .gitignore の対象にはならない。ここに列挙する必要はない。
+
+# OS
+.DS_Store
+
+# エージェントの作業用ディレクトリ（成果物は expected/ に整理済み）
+.exploit/
+
+# 配布 ZIP のビルド成果物
+dist/
+
+# runtime debris that cm/verify runs may leave under app/ (see cm_verify_fix_loop.py)
+*.db
+*.sqlite
+*.sqlite3

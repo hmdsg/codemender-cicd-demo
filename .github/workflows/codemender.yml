@@ -1,0 +1,202 @@
+name: CodeMender
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CM_DOWNLOAD_URL: https://artifactregistry.googleapis.com/download/v1/projects/cmoc-prod/locations/us/repositories/codemender-cli-production/files/cm%3A0.21.0%3Acm-linux-amd64.zip:download?alt=media
+
+jobs:
+  scan:
+    name: CodeMender scan
+    # Workflows for fork and Dependabot pull requests can't read this
+    # repository's secrets, so they can't authenticate to Google Cloud.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write         # Workload Identity Federation
+      security-events: write  # Upload SARIF to code scanning
+      actions: read           # Upload SARIF
+    outputs:
+      findings: ${{ steps.scan.outputs.findings }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # cm needs the base branch history
+          persist-credentials: false
+
+      - uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
+
+      - name: Install the CodeMender CLI
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/cm.zip" "$CM_DOWNLOAD_URL"
+          unzip -q -o "$RUNNER_TEMP/cm.zip" -d "$RUNNER_TEMP/cm"
+          chmod +x "$RUNNER_TEMP/cm/cm"
+          echo "$RUNNER_TEMP/cm" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/cm/cm" --version
+
+      - name: Scan the pull request
+        id: scan
+        env:
+          GOOGLE_CLOUD_PROJECT: ${{ secrets.GCP_PROJECT_ID }}
+          BASE_REF: ${{ github.base_ref }}
+          # Include MEDIUM so authenticated-route business logic flaws (e.g. IDOR/SSRF)
+          # block the PR and trigger autofix.
+          FAIL_ON: CRITICAL,HIGH,MEDIUM
+        run: |
+          cm init
+          cm health --strict
+          status=0
+          cm find . \
+            --diff="origin/$BASE_REF" \
+            --diff-workers=16 \
+            --fail-on="$FAIL_ON" \
+            --format=sarif \
+            --output=codemender.sarif \
+            --model=gemini-3.8-flash \
+            --sandbox=false \
+            --yes \
+            --bypass-warning || status=$?
+
+          # Render a readable report in the GitHub Actions job summary.
+          cm report --status=OPEN --format=md >> "$GITHUB_STEP_SUMMARY" || true
+
+          # Save the findings that failed the scan for the autofix job. Like the
+          # CI gate, skip findings labeled [LEGACY / UNTOUCHED]: they're in code
+          # that the pull request didn't change.
+          echo '[]' > "$RUNNER_TEMP/codemender-findings.json"
+          if [ "$status" -ne 0 ]; then
+            cm report --format=json --status=OPEN \
+              | jq --arg fail_on "$FAIL_ON" '
+                  ($fail_on | ascii_upcase | split(",")) as $severities
+                  | [.[]
+                     | select(.title | startswith("[LEGACY / UNTOUCHED]") | not)
+                     | select(.severity | ascii_upcase | IN($severities[]))]' \
+              > "$RUNNER_TEMP/codemender-findings.json"
+          fi
+          echo "findings=$(jq length "$RUNNER_TEMP/codemender-findings.json")" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Upload results to code scanning
+        if: ${{ !cancelled() && hashFiles('codemender.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: codemender.sarif
+          category: codemender
+
+      - name: Save findings for autofix
+        if: ${{ !cancelled() && steps.scan.outputs.findings > 0 }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: codemender-findings
+          path: ${{ runner.temp }}/codemender-findings.json
+          retention-days: 1
+
+  autofix:
+    name: CodeMender autofix
+    needs: scan
+    if: ${{ !cancelled() && needs.scan.outputs.findings > 0 }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write        # Push the fix branch
+      pull-requests: write   # Open the fix pull request
+      id-token: write        # Workload Identity Federation
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.head_ref }}
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@v10
+
+      - name: Install project test dependencies
+        run: uv sync --frozen --quiet
+
+      - uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
+
+      - name: Install the CodeMender CLI
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/cm.zip" "$CM_DOWNLOAD_URL"
+          unzip -q -o "$RUNNER_TEMP/cm.zip" -d "$RUNNER_TEMP/cm"
+          chmod +x "$RUNNER_TEMP/cm/cm"
+          echo "$RUNNER_TEMP/cm" >> "$GITHUB_PATH"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: codemender-findings
+          path: ${{ runner.temp }}/codemender
+
+      - name: Fix findings
+        env:
+          GOOGLE_CLOUD_PROJECT: ${{ secrets.GCP_PROJECT_ID }}
+        run: |
+          # Keep CodeMender state, virtualenvs, and auth credentials out of commits
+          # and out of the `git clean` that cm fix runs.
+          printf '%s\n' .cm_project 'gha-creds-*.json' '.venv/' 'native/out/' >> .git/info/exclude
+
+          cm init
+          # Configure repository root boundary and test suite verification command.
+          python3 - <<'PY'
+          import os, pathlib, re
+          cfg_path = pathlib.Path.home() / ".codemender" / "config.yaml"
+          ws = os.environ["GITHUB_WORKSPACE"]
+          text = cfg_path.read_text()
+          text = re.sub(r'(vcs:\n\s+type:\s*)""', r'\1"git"', text, count=1)
+          text = re.sub(r'(build:\n\s+command:\s*)""', f'\\1"{ws}/scripts/verify.sh"', text, count=1)
+          text += f'\nproject_paths:\n  - "{ws}"\n'
+          cfg_path.write_text(text)
+          PY
+          cm init --verify
+
+          cm report import -f "$RUNNER_TEMP/codemender/codemender-findings.json" -p "$GITHUB_WORKSPACE"
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          cm report --format=json --status=OPEN \
+            | jq -r '.[] | [.finding_id, .title] | @tsv' \
+            > "$RUNNER_TEMP/findings.tsv"
+          while IFS=$'\t' read -r id title; do
+            # cm fix exits 0 when it makes no edits, so also check for changes.
+            if cm fix "$id" \
+                 --model=gemini-3.8-flash --sandbox=false --yes --bypass-warning < /dev/null &&
+               ! git diff --quiet; then
+              git add -u
+              git commit -q -m "Fix $title" -m "CodeMender finding $id"
+            else
+              echo "::warning::CodeMender didn't fix \"$title\" ($id)."
+            fi
+            # Discard files the fix agent created, such as test output.
+            git reset -q --hard
+            git clean -q -fd
+          done < "$RUNNER_TEMP/findings.tsv"
+
+      - uses: peter-evans/create-pull-request@v8
+        with:
+          branch: codemender/fix-pr-${{ github.event.pull_request.number }}
+          base: ${{ github.head_ref }}
+          title: "CodeMender fixes for #${{ github.event.pull_request.number }}"
+          body: |
+            CodeMender generated and test-verified these fixes for findings introduced in #${{ github.event.pull_request.number }}.
+            Review each commit before you merge this pull request into `${{ github.head_ref }}`.
