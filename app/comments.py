@@ -95,8 +95,8 @@ def get_comment(comment_id: str):
     conn = db.connect(current_app.config["DB_PATH"])
     try:
         row = conn.execute(
-            "SELECT id, report_id, author_id, body FROM comments WHERE id = ?",
-            (comment_id,),
+            "SELECT id, report_id, author_id, body FROM comments WHERE id = ? AND tenant_id = ?",
+            (comment_id, g.tenant_id),
         ).fetchone()
     finally:
         conn.close()
