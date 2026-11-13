@@ -86,3 +86,23 @@ def delete_comment(comment_id: str):
         conn.close()
 
     return jsonify({"deleted": comment_id}), 200
+
+
+
+@bp.get("/api/comments/<comment_id>")
+@require_auth
+def get_comment(comment_id: str):
+    """指定 ID のコメント詳細を返す。"""
+    conn = db.connect(current_app.config["DB_PATH"])
+    try:
+        row = conn.execute(
+            "SELECT id, report_id, author_id, body FROM comments WHERE id = ?",
+            (comment_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if row is None:
+        return jsonify({"error": "not found"}), 404
+
+    return jsonify(dict(row)), 200
